@@ -1,0 +1,221 @@
+# ---------------------------------------------------------------------------
+# Gimnasio: entorno de DESARROLLO
+# ---------------------------------------------------------------------------
+#
+# Uso:
+#   docker compose -f deploy/docker-compose.dev.yml up -d
+#
+# QUÉ CAMBIA RESPECTO DE PRODUCCIÓN
+# ---------------------------------
+#  1. Publica puertos para poder abrir PostgreSQL, Redis y la API desde el
+#     computador. NO se usa así en un servidor.
+#  2. Monta el código como volumen, para que los cambios se vean sin
+#     reconstruir la imagen.
+#  3. `APP_DEBUG` en `true`.
+#  4. Migra y siembra solo al primer arranque, porque con el código montado
+#     cualquier arranque las volvería a correr.
+#
+# ---------------------------------------------------------------------------
+
+name: gimnasio-dev
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "5m"
+    max-file: "2"
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/api/Dockerfile
+    restart: unless-stopped
+    command: ["php", "artisan", "serve", "--host=0.0.0.0", "--port=8080"]
+    ports:
+      - "8080:8080"
+    environment:
+      APP_NAME: "Gimnasio (desarrollo)"
+      APP_ENV: local
+      APP_DEBUG: "true"
+      APP_KEY: ${APP_KEY:?falta APP_KEY en el .env}
+      APP_URL: ${APP_URL:-http://localhost:8080}
+
+      SESSION_DRIVER: database
+
+      LOG_CHANNEL: stack
+      LOG_LEVEL: debug
+
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE:-gimnasio}
+      DB_USERNAME: ${DB_USERNAME:-gimnasio}
+      DB_PASSWORD: ${DB_PASSWORD:-gimnasio}
+
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-gimnasio}
+      CACHE_STORE: redis
+      QUEUE_CONNECTION: redis
+
+      AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER:-http://localhost:9000/application/o/gimnasio/}
+      AUTHENTIK_CLIENT_ID: ${AUTHENTIK_CLIENT_ID:-gimnasio}
+      AUTHENTIK_CLIENT_SECRET: ${AUTHENTIK_CLIENT_SECRET:-cambiar-en-desarrollo}
+      AUTHENTIK_ALGORITMO: ${AUTHENTIK_ALGORITMO:-RS256}
+
+      GIMNASIO_CORRER_MIGRACIONES: "true"
+      ESPERA_INTENTOS: "30"
+    volumes:
+      - ../api:/var/www/html
+      - api-storage:/var/www/html/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "-s", "http://localhost:8080/api/v1/salud"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/web/Dockerfile
+    restart: unless-stopped
+    command: ["node", ".output/server/index.mjs"]
+    ports:
+      - "3000:3000"
+    environment:
+      NUXT_API_BASE: http://api:8080
+      NUXT_PUBLIC_BASE: http://localhost:3000
+    depends_on:
+      - api
+    logging: *logging
+
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL.
+  #
+  # DOS ROLES, Y NO UNO
+  # -------------------
+  # `POSTGRES_USER` es el rol de ARRANQUE: la imagen oficial ejecuta
+  # `initdb --username="$POSTGRES_USER"` y ese rol nace superusuario. Solo
+  # se usa para crear la base y para las tareas administrativas. La
+  # aplicacion NUNCA conecta con el.
+  #
+  # El rol de la aplicacion (`DB_USERNAME`) lo crea
+  # `deploy/postgres/inicializar-rol.sh` al inicializar el volumen, con
+  # NOSUPERUSER y NOBYPASSRLS explicitos. Le da la propiedad de la base
+  # para que las migraciones de Laravel puedan crear el esquema.
+  #
+  # POR QUE IMPORTA: la documentacion de PostgreSQL 18 dice que los
+  # superusuarios "always bypass the row security system", y que
+  # `FORCE ROW LEVEL SECURITY` sujeta solo al DUENO de la tabla, no al
+  # superusuario. Con un solo rol las politicas no se aplicarian y el
+  # aislamiento entre empresas seria decorativo. Ver docs/03.
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:18.6
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-gimnasio}
+      POSTGRES_USER: ${DB_ADMIN_USERNAME:-gimnasio_admin}
+      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD:?falta DB_ADMIN_PASSWORD en el .env}
+      # Rol con el que conecta la aplicacion. Lo crea el script de arranque.
+      APP_DB_ROLE: ${DB_USERNAME:-gimnasio}
+      APP_DB_PASSWORD: ${DB_PASSWORD:?falta DB_PASSWORD en el .env}
+    volumes:
+      - postgres-datos:/var/lib/postgresql/data
+      - ./postgres/inicializar-rol.sh:/docker-entrypoint-initdb.d/inicializar-rol.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-gimnasio} -d ${DB_DATABASE:-gimnasio}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging: *logging
+
+  redis:
+    image: redis:8.8.3-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command:
+      ["redis-server", "--save", "", "--appendonly", "no", "--requirepass", "${REDIS_PASSWORD:-gimnasio}"]
+    volumes:
+      - redis-datos:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-gimnasio}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  authentik-postgres:
+    image: postgres:18.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      POSTGRES_USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+      POSTGRES_PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD:-authentik}
+    volumes:
+      - authentik-postgres-datos:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AUTHENTIK_POSTGRESQL__USER:-authentik}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging: *logging
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2025.10
+    restart: unless-stopped
+    command: server
+    ports:
+      - "9000:9000"
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:-cambiar-en-desarrollo-32-caracteres}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD:-authentik}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      AUTHENTIK_BOOTSTRAP__EMAIL: ${AUTHENTIK_BOOTSTRAP__EMAIL:-admin@ejemplo.cl}
+      AUTHENTIK_BOOTSTRAP__PASSWORD: ${AUTHENTIK_BOOTSTRAP__PASSWORD:-cambiar-en-desarrollo}
+      AUTHENTIK_BOOTSTRAP__TOKEN: ${AUTHENTIK_BOOTSTRAP__TOKEN:-cambiar-en-desarrollo}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - authentik-media:/media
+    logging: *logging
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2025.10
+    restart: unless-stopped
+    command: worker
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:-cambiar-en-desarrollo-32-caracteres}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD:-authentik}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - authentik-media:/media
+    logging: *logging
+
+volumes:
+  postgres-datos:
+  redis-datos:
+  authentik-postgres-datos:
+  authentik-media:
+  api-storage:

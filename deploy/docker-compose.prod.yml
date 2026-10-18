@@ -1,0 +1,305 @@
+name: gimnasio
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # -------------------------------------------------------------------------
+  # Caddy: el único puerto abierto del sistema.
+  # -------------------------------------------------------------------------
+  caddy:
+    image: caddy:2.11.7-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-datos:/data
+      - caddy-config:/config
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:?falta ACME_EMAIL en el .env.prod}
+    depends_on:
+      - api
+      - web
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging: *logging
+
+  # -------------------------------------------------------------------------
+  # API.
+  # -------------------------------------------------------------------------
+  api:
+    image: ${API_IMAGE:?falta API_IMAGE en el .env.prod}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      APP_NAME: "Gimnasio"
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_KEY: ${APP_KEY:?falta APP_KEY en el .env.prod}
+      APP_URL: ${APP_URL:?falta APP_URL en el .env.prod}
+
+      # La sesión va por HTTPS y en la base de datos.
+      SESSION_SECURE_COOKIE: "true"
+      SESSION_SAME_SITE: lax
+      SESSION_DRIVER: database
+
+      LOG_CHANNEL: stack
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_STACK: daily
+      LOG_DAILY_DAYS: "30"
+
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE:-gimnasio}
+      DB_USERNAME: ${DB_USERNAME:?falta DB_USERNAME en el .env.prod}
+      DB_PASSWORD: ${DB_PASSWORD:?falta DB_PASSWORD en el .env.prod}
+
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?falta REDIS_PASSWORD en el .env.prod}
+      CACHE_STORE: redis
+      QUEUE_CONNECTION: redis
+
+      AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER:?falta AUTHENTIK_ISSUER en el .env.prod}
+      AUTHENTIK_CLIENT_ID: ${AUTHENTIK_CLIENT_ID:?falta AUTHENTIK_CLIENT_ID en el .env.prod}
+      AUTHENTIK_CLIENT_SECRET: ${AUTHENTIK_CLIENT_SECRET:?falta AUTHENTIK_CLIENT_SECRET en el .env.prod}
+      AUTHENTIK_ALGORITMO: ${AUTHENTIK_ALGORITMO:-RS256}
+      AUTHENTIK_GRUPO_ADMINISTRADORES: ${AUTHENTIK_GRUPO_ADMINISTRADORES:-gimnasio-administradores}
+
+      # Las migraciones NO se corren en cada arranque: se aplican una vez, a
+      # mano, con `docker compose run --rm api php artisan migrate --force`.
+      GIMNASIO_CORRER_MIGRACIONES: "false"
+      ESPERA_INTENTOS: "30"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "-s", "http://localhost:8080/api/v1/salud"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging: *logging
+
+  # -------------------------------------------------------------------------
+  # Trabajador de colas: misma imagen, otro comando.
+  #
+  # Es el proceso donde el aislamiento se juega en serio: reutiliza la misma
+  # conexión de PostgreSQL para trabajos de gimnasios distintos. Por eso cada
+  # trabajo abre su propia transacción con `set_config(..., true)`.
+  # -------------------------------------------------------------------------
+  cola:
+    image: ${API_IMAGE:?falta API_IMAGE en el .env.prod}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    command:
+      ["php", "artisan", "queue:work", "--sleep=3", "--tries=3", "--max-time=3600", "--verbose"]
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_KEY: ${APP_KEY}
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE:-gimnasio}
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      CACHE_STORE: redis
+      QUEUE_CONNECTION: redis
+      SESSION_DRIVER: database
+      LOG_CHANNEL: stderr
+      AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER}
+    logging: *logging
+
+  # -------------------------------------------------------------------------
+  # Planificador: cierra visitas abiertas y detecta socios en riesgo.
+  # -------------------------------------------------------------------------
+  planificador:
+    image: ${API_IMAGE:?falta API_IMAGE en el .env.prod}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    command: ["php", "artisan", "schedule:work"]
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_KEY: ${APP_KEY}
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE:-gimnasio}
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      CACHE_STORE: redis
+      QUEUE_CONNECTION: redis
+      SESSION_DRIVER: database
+      LOG_CHANNEL: stderr
+      AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER}
+    logging: *logging
+
+  # -------------------------------------------------------------------------
+  # Interfaz.
+  # -------------------------------------------------------------------------
+  web:
+    image: ${WEB_IMAGE:?falta WEB_IMAGE en el .env.prod}
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      NUXT_API_BASE: http://api:8080
+      NUXT_PUBLIC_BASE: ${APP_URL}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging: *logging
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL.
+  #
+  # Sin puerto publicado: la base no es accesible desde afuera del host. Para
+  # entrar hay que usar un túnel SSH.
+  # -------------------------------------------------------------------------
+  # DOS ROLES, Y NO UNO
+  # -------------------
+  # `POSTGRES_USER` es el rol de ARRANQUE: la imagen oficial ejecuta
+  # `initdb --username="$POSTGRES_USER"` y ese rol nace superusuario. Solo
+  # se usa para crear la base y para las tareas administrativas. La
+  # aplicacion NUNCA conecta con el.
+  #
+  # El rol de la aplicacion (`DB_USERNAME`) lo crea
+  # `deploy/postgres/inicializar-rol.sh` al inicializar el volumen, con
+  # NOSUPERUSER y NOBYPASSRLS explicitos. Le da la propiedad de la base
+  # para que las migraciones de Laravel puedan crear el esquema.
+  #
+  # POR QUE IMPORTA: la documentacion de PostgreSQL 18 dice que los
+  # superusuarios "always bypass the row security system", y que
+  # `FORCE ROW LEVEL SECURITY` sujeta solo al DUENO de la tabla, no al
+  # superusuario. Con un solo rol las politicas no se aplicarian y el
+  # aislamiento entre empresas seria decorativo. Ver docs/03.
+  postgres:
+    image: postgres:18.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-gimnasio}
+      POSTGRES_USER: ${DB_ADMIN_USERNAME:-gimnasio_admin}
+      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD:?falta DB_ADMIN_PASSWORD en el .env.prod}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+      # Rol con el que conecta la aplicacion. Lo crea el script de arranque.
+      APP_DB_ROLE: ${DB_USERNAME:-gimnasio}
+      APP_DB_PASSWORD: ${DB_PASSWORD:?falta DB_PASSWORD en el .env.prod}
+    volumes:
+      - postgres-datos:/var/lib/postgresql/data
+      - ./postgres/inicializar-rol.sh:/docker-entrypoint-initdb.d/inicializar-rol.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-gimnasio} -d ${DB_DATABASE:-gimnasio}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  redis:
+    image: redis:8.8.3-alpine
+    restart: unless-stopped
+    command:
+      ["redis-server", "--save", "", "--appendonly", "no", "--requirepass", "${REDIS_PASSWORD:?falta REDIS_PASSWORD en el .env.prod}"]
+    volumes:
+      - redis-datos:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+
+  # -------------------------------------------------------------------------
+  # Authentik: identidad. `server` + `worker` con la misma imagen y su propia
+  # base de datos.
+  #
+  # La interfaz de administración NO se publica. Para entrar hay que usar un
+  # túnel SSH hasta el puerto 9000 del contenedor.
+  # -------------------------------------------------------------------------
+  authentik-postgres:
+    image: postgres:18.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      POSTGRES_USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+      POSTGRES_PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD}
+    volumes:
+      - authentik-postgres-datos:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AUTHENTIK_POSTGRESQL__USER:-authentik}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2025.10
+    restart: unless-stopped
+    command: server
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?falta AUTHENTIK_SECRET_KEY en el .env.prod}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      AUTHENTIK_BOOTSTRAP__EMAIL: ${AUTHENTIK_BOOTSTRAP__EMAIL}
+      AUTHENTIK_BOOTSTRAP__PASSWORD: ${AUTHENTIK_BOOTSTRAP__PASSWORD}
+      AUTHENTIK_BOOTSTRAP__TOKEN: ${AUTHENTIK_BOOTSTRAP__TOKEN}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - authentik-media:/media
+    logging: *logging
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2025.10
+    restart: unless-stopped
+    command: worker
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - authentik-media:/media
+    logging: *logging
+
+volumes:
+  postgres-datos:
+  redis-datos:
+  authentik-postgres-datos:
+  authentik-media:
+  caddy-datos:
+  caddy-config:

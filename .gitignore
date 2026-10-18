@@ -1,0 +1,27 @@
+# Dependencias
+/api/vendor/
+/web/node_modules/
+/web/.nuxt/
+/web/.output/
+
+# Entornos: NUNCA se versionan. acá solo vive `.env.example`.
+.env
+.env.*
+!.env.example
+
+# Certificados de Authentik
+deploy/authentik/certs/
+
+# Datos locales de desarrollo
+/api/storage/*.key
+/api/storage/framework/
+/api/storage/logs/
+/api/bootstrap/cache/
+/api/vendor/
+
+# Sistema operativo y editores
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

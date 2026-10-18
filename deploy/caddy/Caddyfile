@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------------
+# Caddy: el único servicio con puertos publicados.
+# ---------------------------------------------------------------------------
+#
+# TODO lo demás (API, interfaz, PostgreSQL, Redis, Authentik) habla por la red
+# interna de Docker y no es alcanzable desde afuera.
+#
+# La API NO se publica directamente: el navegador nunca habla con ella. La
+# cookie de sesión va a la interfaz (Nuxt), que actúa de servidor
+# intermediario y la reenvía. Así el token nunca queda expuesto en el código
+# del navegador.
+# ---------------------------------------------------------------------------
+
+{$APP_DOMAIN:localhost} {
+    encode zstd gzip
+
+    # Cabeceras de seguridad.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # La interfaz es SSR y sirve sus propios recursos: no necesita
+        # permitir scripts de terceros, y no hay ninguno.
+        Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        -Server
+    }
+
+    # La interfaz.
+    reverse_proxy web:3000
+
+    # La API, solo para el servidor de la interfaz y por dentro.
+    #
+    # La ruta no se publica hacia afuera a propósito: si alguien la expone,
+    # la API queda respondiendo con la cookie de sesión de un tercero.
+    handle /api/* {
+        reverse_proxy api:8080
+    }
+
+    log {
+        output stdout
+        format json
+    }
+}
